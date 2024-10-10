@@ -9,13 +9,12 @@ from lpips import LPIPS
 
 device = "cuda"
 
-def make_plot(x_orig, x_recon):
-    x_comb = torch.cat([x.cpu().detach(), out.cpu().detach()], dim=2)
+def make_plot(x_orig, x_recon, nrow=8):
+    x_comb = torch.cat([x_orig.cpu().detach(), x_recon.cpu().detach()], dim=2)
     x_comb = ((x_comb + 1) / 2)
-    grid_image = torchvision.utils.make_grid(x_comb, nrow=8).permute(1, 2, 0)
+    grid_image = torchvision.utils.make_grid(x_comb, nrow=nrow).permute(1, 2, 0)
     grid_image = (grid_image.numpy() * 255).astype("uint8")
     return PIL.Image.fromarray(grid_image)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -44,8 +43,8 @@ if __name__ == "__main__":
     optim = torch.optim.Adam(vqvae.parameters(), lr=1e-4)
 
     steps = 0
+    best_loss = float("inf")
     for epoch in range(100):
-        mean_loss = 0
         for i, (video, _) in enumerate(tqdm.tqdm(loader)):
             video = video.to(device)
             frame_idx = torch.randint(0, video.shape[1], (8,))
@@ -57,7 +56,10 @@ if __name__ == "__main__":
             percep_loss = perceptual_loss_fn(out, x)
             recon_loss = (l1_loss + percep_loss).mean()
             train_loss = quantize_loss + recon_loss
-            mean_loss += train_loss.item()
+
+            if steps > 1000 and train_loss.item() < best_loss:
+                best_loss = train_loss.item()
+                torch.save(vqvae.state_dict(), f"vqvae_{args.dataset}_best.pt")
 
             if steps % 10 == 0:
                 wandb.log({"train/quantize_loss": quantize_loss.item(),
@@ -71,6 +73,3 @@ if __name__ == "__main__":
             train_loss.backward()
             optim.step()
             steps += 1
-        mean_loss /= len(loader)
-        print(f"Epoch {epoch}, loss: {mean_loss}")
-

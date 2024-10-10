@@ -50,7 +50,7 @@ class SelfAttention(nn.Module):
 class STBlock(nn.Module):
     def __init__(self, dim, num_heads):
         super().__init__()
-        self.spatial_attn = SelfAttention(dim, num_heads)
+        self.spatial_attn = SelfAttention(dim, num_heads, causal=True)
         self.temporal_attn = SelfAttention(dim, num_heads, causal=True)
         self.mlp = MLP(dim)
         self.norm = nn.LayerNorm(dim, eps=1e-5)
@@ -58,7 +58,7 @@ class STBlock(nn.Module):
     def forward(self, x):
         B, T, S, C = x.shape
         x_SC = rearrange(x, 'B T S C -> (B T) S C')
-        x_SC = x_SC + self.spatial_attn(self.norm(x_SC))
+        # x_SC = x_SC + self.spatial_attn(self.norm(x_SC))
 
         x_TC = rearrange(x_SC, '(B T) S C -> (B S) T C', T=T)
         x_TC = x_TC + self.temporal_attn(self.norm(x_TC))
@@ -68,14 +68,24 @@ class STBlock(nn.Module):
         return x
 
 class STTransformer(nn.Module):
-    def __init__(self, num_layers, dim, num_heads):
+    def __init__(self, num_layers, dim, num_heads, vocab_size=512, max_len=4, spatial_size=64):
         super().__init__()
+        self.spatial_size = spatial_size
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.pos_embed = nn.Embedding(max_len*spatial_size, dim)
         self.layers = nn.ModuleList([
             STBlock(dim, num_heads) for _ in range(num_layers)
         ])
+        self.proj = nn.Linear(dim, vocab_size)
     def forward(self, x):
+        x = rearrange(x, 'B T S -> B (T S)')
+        tok_emb = self.token_embed(x)
+        tok_pos = self.pos_embed(torch.arange(x.shape[1], device=x.device))
+        x = tok_emb + tok_pos
+        x = rearrange(x, 'B (T S) C -> B T S C', S=self.spatial_size)
         for layer in self.layers:
             x = layer(x)
+        x = self.proj(x)
         return x
 
 if __name__ == '__main__':

@@ -52,7 +52,7 @@ class VQGAN(nn.Module):
     def decode(self, z):
         # codebook_mapping = self.codebook.embedding(z)
         indices = z
-        ix_to_vectors = self.codebook.embedding(indices).reshape(indices.shape[0], 16, 16, 256)
+        ix_to_vectors = self.codebook.embedding(indices).reshape(indices.shape[0], 8, 8, 8)
         ix_to_vectors = ix_to_vectors.permute(0, 3, 1, 2)
         post_quant_conv_mapping = self.post_quant_conv(ix_to_vectors)
         # post_quant_conv_mapping = self.post_quant_conv(z)
