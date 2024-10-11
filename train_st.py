@@ -43,7 +43,7 @@ def evaluate():
         video = video.to(device)
         action = action.to(device)
         video = video[:,start:start+max_len,...]
-        action = action[:,start:start+max_len].unsqueeze(-1) + 512
+        action = action[:,start:start+max_len].unsqueeze(-1) + codebook_size
 
         # tokenize the video
         video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
@@ -63,15 +63,44 @@ def evaluate():
 
     return video, action, indices
 
+@torch.no_grad()
+def gen_action_conditioned(image_tokens, actions, out_path=None):
+    image_tokens = image_tokens[:,0,:spatial_size]
+    print(image_tokens.shape)
+
+    tokens = image_tokens
+    for action in actions:
+        print('action: ', action)
+        action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
+        tokens = torch.cat([tokens, action], dim=1)
+        print(tokens.shape)
+        tokens = st_transformer.generate(tokens, spatial_size)
+        print(tokens.shape)
+    action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
+    tokens = torch.cat([tokens, action], dim=1)
+
+    gen_tokens = rearrange(tokens, "b (t s) -> (b t) s", t=max_len, s=(spatial_size+1))
+    gen_video_tokens = torch.clip(gen_tokens[:,:spatial_size], 0, 511)
+    gen_actions = torch.clip(gen_tokens[:,spatial_size]-codebook_size, 0, 2) 
+    gen_actions = rearrange(gen_actions, "(b t) -> b t", b=vis_count, t=max_len)
+    gen_video = vqvae.decode(gen_video_tokens)
+    gen_video = rearrange(gen_video, "(b t) c h w -> b t c h w", b=vis_count, t=max_len)
+    image = make_video_plot(video_orig, actions_orig, gen_video, gen_actions, nrow=max_len)
+    wandb.log({f"act_cond={actions[0]}": wandb.Image(image,file_type="jpg")})
+    if out_path is not None:
+        image.save(out_path)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="dmlab")
     args = parser.parse_args()
 
+    codebook_size = 512
+
     if args.dataset == "dmlab":
         dataset_path = Path("../teco/dmlab/")
         config = VQGANConfig(
-            num_codebook_vectors=512,
+            num_codebook_vectors=codebook_size,
             latent_dim=8, 
             resolution=64, 
             ch_mult=(1, 2, 2, 2)
@@ -99,9 +128,9 @@ if __name__ == "__main__":
     vqvae = VQGAN(config).to(device)
     vqvae.load_state_dict(torch.load("vqvae_dmlab_best.pt", weights_only=True))
     # st_transformer = STTransformer(4, 256, 8, max_len=max_len, spatial_size=64).to(device)
-    # gpt_config = GPTConfig(max_len*spatial_size+1, 512+3, 1024, 16, 12, True, 0.1)
+    # gpt_config = GPTConfig(max_len*spatial_size+1, codebook_size+3, 1024, 16, 12, True, 0.1)
     gpt_config = GPTConfig(block_size=max_len*(spatial_size+1), 
-                           vocab_size=512+3, 
+                           vocab_size=codebook_size+3, 
                            n_embd=1024, 
                            n_head=16, 
                            n_layer=12, 
@@ -116,7 +145,7 @@ if __name__ == "__main__":
             video = video.to(device)
             action = action.to(device)
             video = video[:,start:start+max_len,...]
-            action = action[:,start:start+max_len].unsqueeze(-1) + 512
+            action = action[:,start:start+max_len].unsqueeze(-1) + codebook_size
 
             # tokenize the video
             with torch.no_grad():
@@ -152,7 +181,7 @@ if __name__ == "__main__":
 
                         # original video
                         video_orig = video[0:vis_count]
-                        actions_orig = action[0:vis_count] - 512
+                        actions_orig = action[0:vis_count] - codebook_size
 
                         # reconstructed video
                         video_tokens = indices[0:vis_count]
@@ -162,7 +191,7 @@ if __name__ == "__main__":
                         res = st_transformer.generate(tokens, (spatial_size+1)*frames_to_gen, verbose=True)
                         gen_tokens = rearrange(res, "b (t s) -> (b t) s", t=max_len, s=(spatial_size+1))
                         gen_video_tokens = torch.clip(gen_tokens[:,:spatial_size], 0, 511)
-                        gen_actions = torch.clip(gen_tokens[:,spatial_size]-512, 0, 2) 
+                        gen_actions = torch.clip(gen_tokens[:,spatial_size]-codebook_size, 0, 2) 
                         gen_actions = rearrange(gen_actions, "(b t) -> b t", b=vis_count, t=max_len)
                         gen_video = vqvae.decode(gen_video_tokens)
                         gen_video = rearrange(gen_video, "(b t) c h w -> b t c h w", b=vis_count, t=max_len)
@@ -171,7 +200,12 @@ if __name__ == "__main__":
                         # wandb log video
                         wandb.log({f"video cond={cond_frame}": wandb.Video(f"gen_video_{cond_frame}.mp4")})
                         wandb.log({f"cond={cond_frame}": wandb.Image(image,file_type="jpg")})
-                        # image.save(f"gen_video_{cond_frame}.png")
+
+                    for action in range(3):
+                        gen_action_conditioned(
+                                video_tokens, 
+                                [action for i in range(max_len-1)],
+                                f"cond_video_{action}.jpg")
 
 
             if steps % 10 == 0:
