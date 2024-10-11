@@ -2,7 +2,7 @@ import torch, torch.nn as nn, torchvision, argparse, time, time, tqdm, PIL, wand
 from einops import rearrange
 from torch.utils.data import DataLoader
 from pathlib import Path
-from dataset import VideoDataset, visualize_video
+from dataset import VideoDataset
 
 from vqvae import VQGAN, VQGANConfig
 from lpips import LPIPS
