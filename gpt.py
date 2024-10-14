@@ -168,6 +168,7 @@ class GPTLanguageModel(nn.Module):
         return logits, loss
 
     def generate(self, idx, token_count, verbose=False):
+        self.eval()
         # idx is (B, T) array of indices in the current context
         if verbose:
             print(f"Generating {token_count} tokens with bs={idx.shape[0]}")
@@ -192,6 +193,7 @@ class GPTLanguageModel(nn.Module):
             print(f"Generation took {dur:.2f} seconds")
             print(f"tokens per second: {token_count/dur:.2f}")
 
+        self.train()
         return idx
 
     def generate_maskgit(self, init, steps=1):

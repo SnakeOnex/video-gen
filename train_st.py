@@ -4,10 +4,8 @@ from pathlib import Path
 from einops import rearrange
 
 from torch.utils.data import DataLoader
-from dataset import VideoDataset, annotate_video, encode_video
+from dataset import VideoDataset, annotate_video, encode_video, action_to_text
 from vqvae import VQGAN, VQGANConfig
-# from st_transformer import STTransformer
-# from st_transformer2 import STTransformer
 from gpt import GPTLanguageModel, GPTConfig
 from train_vqvae import make_plot
 
@@ -48,7 +46,7 @@ def evaluate():
         # tokenize the video
         video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
         _, indices, _ = vqvae.encode(video_vectorized)
-        indices = rearrange(indices, "(b f h w) -> b f (h w)", b=bs, f=max_len, w=int(spatial_size**0.5), h=int(spatial_size**0.5))
+        indices = rearrange(indices, "(b f h w) -> b f (h w)", b=video.shape[0], f=max_len, w=int(spatial_size**0.5), h=int(spatial_size**0.5))
 
         indices = torch.cat([indices, action], dim=2)
 
@@ -63,12 +61,12 @@ def evaluate():
     return test_loss, video, action, indices
 
 @torch.no_grad()
-def gen_action_conditioned(image_tokens, actions):
+def gen_action_conditioned(image_tokens, actions, name):
     image_tokens = image_tokens[:,0,:spatial_size]
 
     tokens = image_tokens
     for action in actions:
-        action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
+        action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action + codebook_size
         tokens = torch.cat([tokens, action], dim=1)
         tokens = st_transformer.generate(tokens, spatial_size)
     action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
@@ -81,9 +79,10 @@ def gen_action_conditioned(image_tokens, actions):
     gen_video = vqvae.decode(gen_video_tokens)
     gen_video = rearrange(gen_video, "(b t) c h w -> b t c h w", b=vis_count, t=max_len)
     image = make_video_plot(video_orig, actions_orig, gen_video, gen_actions, nrow=max_len)
-    wandb.log({f"act_cond={actions[0]}": wandb.Image(image,file_type="jpg")})
-    make_video(video_orig, actions_orig, gen_video, gen_actions, f"gen_video_act_cond_{actions[0]}.mp4")
-    wandb.log({f"video act_cond={actions[0]}": wandb.Video(f"gen_video_act_cond_{actions[0]}.mp4")})
+    image.save(f"act_cond_{name}.jpg")
+    wandb.log({f"act_cond={name}": wandb.Image(image,file_type="jpg")})
+    make_video(video_orig, actions_orig, gen_video, gen_actions, f"video_act_cond_{name}.mp4")
+    wandb.log({f"video_act_cond={name}": wandb.Video(f"video_act_cond_{name}.mp4")})
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -126,9 +125,9 @@ if __name__ == "__main__":
     vqvae.load_state_dict(torch.load("vqvae_dmlab_best.pt", weights_only=True))
     gpt_config = GPTConfig(block_size=max_len*(spatial_size+1), 
                            vocab_size=codebook_size+3, 
-                           n_embd=1024, 
-                           n_head=16, 
-                           n_layer=12, 
+                           n_embd=784, 
+                           n_head=8, 
+                           n_layer=6, 
                            causal=True, 
                            dropout=0.1)
     st_transformer = GPTLanguageModel(gpt_config).to(device)
@@ -185,7 +184,6 @@ if __name__ == "__main__":
                         video_tokens = indices[0:vis_count]
                         tokens = video_tokens[:,:cond_frame,...]
                         tokens = tokens.view(vis_count, -1)
-                        st_transformer.eval()
                         res = st_transformer.generate(tokens, (spatial_size+1)*frames_to_gen, verbose=True)
                         gen_tokens = rearrange(res, "b (t s) -> (b t) s", t=max_len, s=(spatial_size+1))
                         gen_video_tokens = torch.clip(gen_tokens[:,:spatial_size], 0, 511)
@@ -200,9 +198,13 @@ if __name__ == "__main__":
                         wandb.log({f"cond={cond_frame}": wandb.Image(image,file_type="jpg")})
 
                     for action in range(3):
-                        gen_action_conditioned(
-                                video_tokens, 
-                                [action for i in range(max_len-1)])
+                        name = action_to_text(action)
+                        gen_action_conditioned(video_tokens, [action for i in range(max_len-1)], name)
+
+                    # alternating left and right
+                    actions = [0, 0] + [1 if i % 8 < 4 else 0 for i in range(max_len)]
+                    actions = actions[:max_len-1]
+                    gen_action_conditioned(video_tokens, actions, name="alternating")
 
 
             if steps % 10 == 0:
