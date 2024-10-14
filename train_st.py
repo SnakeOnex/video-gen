@@ -60,22 +60,17 @@ def evaluate():
         test_loss += F.cross_entropy(logits, targets).item()
     test_loss /= len(test_loader)
     wandb.log({"valid/loss": test_loss})
-
-    return video, action, indices
+    return test_loss, video, action, indices
 
 @torch.no_grad()
-def gen_action_conditioned(image_tokens, actions, out_path=None):
+def gen_action_conditioned(image_tokens, actions):
     image_tokens = image_tokens[:,0,:spatial_size]
-    print(image_tokens.shape)
 
     tokens = image_tokens
     for action in actions:
-        print('action: ', action)
         action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
         tokens = torch.cat([tokens, action], dim=1)
-        print(tokens.shape)
         tokens = st_transformer.generate(tokens, spatial_size)
-        print(tokens.shape)
     action = torch.zeros(tokens.shape[0],1, device=device, dtype=torch.int) + action
     tokens = torch.cat([tokens, action], dim=1)
 
@@ -87,19 +82,20 @@ def gen_action_conditioned(image_tokens, actions, out_path=None):
     gen_video = rearrange(gen_video, "(b t) c h w -> b t c h w", b=vis_count, t=max_len)
     image = make_video_plot(video_orig, actions_orig, gen_video, gen_actions, nrow=max_len)
     wandb.log({f"act_cond={actions[0]}": wandb.Image(image,file_type="jpg")})
-    if out_path is not None:
-        image.save(out_path)
+    make_video(video_orig, actions_orig, gen_video, gen_actions, f"gen_video_act_cond_{actions[0]}.mp4")
+    wandb.log({f"video act_cond={actions[0]}": wandb.Video(f"gen_video_act_cond_{actions[0]}.mp4")})
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="dmlab")
+    parser.add_argument("--max_len", type=int, default=12)
     args = parser.parse_args()
 
     codebook_size = 512
 
     if args.dataset == "dmlab":
         dataset_path = Path("../teco/dmlab/")
-        config = VQGANConfig(
+        vqgan_config = VQGANConfig(
             num_codebook_vectors=codebook_size,
             latent_dim=8, 
             resolution=64, 
@@ -110,12 +106,13 @@ if __name__ == "__main__":
     max_len = 12
     bs = 8
     spatial_size = 64
+    # visualization params
     vis_count = 4
     cond_frames = [1, 2, 4]
 
     wandb.init(project="st-video", 
                name=f"{args.dataset}-{int(time.time()):.0f}",
-               config=config.__dict__)
+               config=vqgan_config.__dict__)
 
     train_set = VideoDataset(dataset_path / "train")
     test_set = VideoDataset(dataset_path / "test")
@@ -125,10 +122,8 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_set, batch_size=bs, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_set, batch_size=bs, shuffle=True, drop_last=True)
 
-    vqvae = VQGAN(config).to(device)
+    vqvae = VQGAN(vqgan_config).to(device)
     vqvae.load_state_dict(torch.load("vqvae_dmlab_best.pt", weights_only=True))
-    # st_transformer = STTransformer(4, 256, 8, max_len=max_len, spatial_size=64).to(device)
-    # gpt_config = GPTConfig(max_len*spatial_size+1, codebook_size+3, 1024, 16, 12, True, 0.1)
     gpt_config = GPTConfig(block_size=max_len*(spatial_size+1), 
                            vocab_size=codebook_size+3, 
                            n_embd=1024, 
@@ -140,6 +135,7 @@ if __name__ == "__main__":
     optim = torch.optim.Adam(st_transformer.parameters(), lr=1e-4)
 
     steps = 0
+    best_loss = float("inf")
     for epoch in range(100):
         for i, (video, action) in enumerate(tqdm.tqdm(train_loader)):
             video = video.to(device)
@@ -156,17 +152,12 @@ if __name__ == "__main__":
             # append action tokens
             # b x f x 1 + b x f x s = b x f x (s+1)
             indices = torch.cat([indices, action], dim=2)
-            
-
             tokens = rearrange(indices, "b f s -> b (f s)")
             x = tokens[:,:-1]
             targets = tokens[:,1:].contiguous().view(-1)
 
             logits, _ = st_transformer(x)
-            # logits = rearrange(logits, "b f s c -> (b f s) c")
-            # targets = rearrange(indices, "b f s -> (b f s)")
             logits = rearrange(logits, "b t c -> (b t) c")
-            # targets = rearrange(indices, "b f s -> (b f s)")
             loss = F.cross_entropy(logits, targets)
 
             optim.zero_grad()
@@ -174,7 +165,14 @@ if __name__ == "__main__":
             optim.step()
 
             if steps % 1000 == 0:
-                video, action, indices = evaluate()
+                test_loss, video, action, indices = evaluate()
+                if test_loss < best_loss:
+                    best_loss = test_loss
+                    torch.save(st_transformer.state_dict(), "st_transformer_best.pt")
+                else:
+                    print("early stopping")
+                    exit(0)
+
                 with torch.no_grad():
                     for cond_frame in cond_frames:
                         frames_to_gen = max_len - cond_frame
@@ -204,8 +202,7 @@ if __name__ == "__main__":
                     for action in range(3):
                         gen_action_conditioned(
                                 video_tokens, 
-                                [action for i in range(max_len-1)],
-                                f"cond_video_{action}.jpg")
+                                [action for i in range(max_len-1)])
 
 
             if steps % 10 == 0:
