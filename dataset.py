@@ -39,7 +39,7 @@ def annotate_video(video, actions):
     return video
 
 def encode_video(video, save_path):
-    writer = imageio.get_writer(save_path, fps=4)
+    writer = imageio.get_writer(save_path, fps=2)
     for frame in video:
         writer.append_data(frame)
     writer.close()

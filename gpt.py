@@ -130,7 +130,6 @@ class GPTLanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(self.config.n_embd) # final layer norm
         self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size)
 
-        # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -195,45 +194,4 @@ class GPTLanguageModel(nn.Module):
 
         self.train()
         return idx
-
-    def generate_maskgit(self, init, steps=1):
-        self.eval()
-
-        mask = torch.ones_like(init).bool()
-        output = torch.zeros_like(init)+init # empty output (all mask tokens)
-        unmasked_count = 0
-        with torch.no_grad():
-            for step in range(steps):
-                logits, _ = self(output)
-                probs = F.softmax(logits, dim=-1)
-                B, T, C = probs.shape
-
-                ratio = torch.tensor((step+1) / steps)
-                gamma_r = gamma_func(ratio, mode='square')
-
-                mask_count = (gamma_r * T).ceil().to(torch.int64)
-                unmask_count = (256 - mask_count) - unmasked_count
-                unmasked_count += unmask_count
-                # print(f"{ratio=}, {gamma_r=}, {unmask_count=} {unmasked_count=}")
-
-                # sample from the distribution
-                samples_vec = torch.ones((B, T), device=probs.device, dtype=torch.int64)
-
-                for i in range(B):
-                    samples_vec[i, :] = torch.multinomial(probs[i, :], num_samples=1).view(-1)
-
-                sampled_probs = probs[torch.arange(B).view(-1, 1), torch.arange(T).view(1, -1), samples_vec]
-                sampled_probs[~mask] = 0. # mask out the already sampled tokens
-                sorted_probs = torch.argsort(sampled_probs, dim=-1, descending=True)
-
-                # unmask the top gamma_func(steps) tokens (for each example in the batch)
-                top_k = sorted_probs[:, :unmask_count]
-                mask[torch.arange(B).view(-1, 1), top_k] = 0
-                output[:, top_k] = samples_vec[:, top_k]
-                output[torch.arange(B).view(-1, 1), top_k] = samples_vec[torch.arange(B).view(-1, 1), top_k]
-        self.train()
-
-        return output
-
-
 
