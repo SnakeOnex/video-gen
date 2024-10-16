@@ -1,4 +1,5 @@
 import torch, torch.nn as nn, torchvision, argparse, time, tqdm, PIL, wandb, torch.nn.functional as F
+import matplotlib.pyplot as plt
 from pathlib import Path
 from vqvae import VQGAN, VQGANConfig
 from gpt import GPTLanguageModel, GPTConfig
@@ -41,16 +42,45 @@ if __name__ == '__main__':
     video, action = dataset[0]
     video = video.unsqueeze(0).to(device)
     action = action.unsqueeze(0).to(device)
-    video = video[:,:cond_actions_length+10]
-    action = action[:,:cond_actions_length+10]
+    video = video[:,:1]
+    action = action[:,:1]
     tokens = pack_tokens(video, action, vqvae)
     cond_tokens = tokens[:,:1,:]
-    action_tokens = tokens[:,-cond_actions_length:,spatial_size:spatial_size+1]
-    action_tokens = action_tokens * 0 + 2 + codebook_size
-    print(cond_tokens.shape, action_tokens.shape)
+    print(tokens.shape)
 
-    # 2. generate video
-    generated_video = generate_video(cond_tokens, action_tokens, st_transformer, context_size)
-    print(generated_video.shape)
-    img = make_video_plot([generated_video], vqvae, nrow=cond_actions_length+1)
-    img.save("generated_video.png")
+    fig, ax = plt.subplots(1, 1)
+
+    def button_press(event):
+        global action_tokens, cond_tokens
+        print("Button press: ", event.key)
+        if event.key == 'a':
+            action = 0
+        elif event.key == 'd':
+            action = 1
+        elif event.key == 'w':
+            action = 2
+        else:
+            return
+        action_tokens = action_tokens * 0 + action + codebook_size
+        # cond_tokens = cond_tokens[:,1:,:]
+
+    fig.canvas.mpl_connect('key_press_event', button_press)
+
+    while True:
+        print("Waiting for key press")
+        action_tokens = tokens[:,-1:,spatial_size:spatial_size+1]
+        print("pre-key: ", action_tokens)
+        plt.waitforbuttonpress()
+        print("post-key: ", action_tokens)
+        # action_tokens = action_tokens * 0 + 2 + codebook_size
+
+        # 2. generate video
+        cond_tokens = generate_video(cond_tokens, action_tokens, st_transformer, context_size)
+        cond_tokens = cond_tokens[:,1:,:]
+        img = make_video_plot([cond_tokens], vqvae, nrow=cond_actions_length+1)
+        ax.imshow(img)
+        plt.draw()
+
+
+
+
