@@ -2,6 +2,7 @@ import torch, torch.nn as nn, torchvision, argparse, time, tqdm, PIL, wandb, tor
 import numpy as np
 from pathlib import Path
 from einops import rearrange
+from dataclasses import dataclass
 
 from torch.utils.data import DataLoader
 from dataset import VideoDataset, annotate_video, encode_video, action_to_text
@@ -113,25 +114,121 @@ def generate_video(cond_tokens, action_tokens, st_transformer, context_size, spa
     tokens = torch.cat([tokens, action], dim=1)
     return rearrange(tokens, "b (t s) -> b t s", t=T_gen+T_cond, s=(spatial_size+1))
 
+@dataclass
+class TrainerConfig():
+    gpt_config: GPTConfig
+    gpt_path: str
+    vqvae_config: VQGANConfig
+    vqvae_path: str
+    dataset_path: str
+    context_size: int
+    spatial_size: int
+    gen_video_size: int
+    batch_size: int
+    lr: float
+    vis_count: int
+    cond_video_length: int
+    cond_actions_length: int
+
+    def __post_init__(self):
+        self.spatial_dim = self.vqvae_config.spatial_dim
+
+class Trainer():
+    def __init__(self, config: TrainerConfig):
+        for k, v in config.__dict__.items(): setattr(self, k, v)
+
+        # 1. init models
+        self.vqvae = VQGAN(self.config.vqvae_config).to(self.device).eval()
+        self.vqvae.load_state_dict(torch.load(self.config.vqvae_path, weights_only=True))
+
+        self.gpt = GPTLanguageModel(self.config.gpt_config).to(self.device)
+        self.gpt.load_state_dict(torch.load(self.config.gpt_path, weights_only=True))
+
+        # 2. init optimizers
+        self.optim = self.configure_optimizers()
+
+        # 3. init datasets
+        self.train_loader = DataLoader(VideoDataset(self.config.dataset_path / "train"), batch_size=self.config.batch_size, shuffle=True, drop_last=True)
+        self.test_loader = DataLoader(VideoDataset(self.config.dataset_path / "test"), batch_size=2*self.config.batch_size, shuffle=True, drop_last=True)
+
+        # 4. running variables
+        self.steps = 0
+        self.best_loss = float("inf")
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.gpt.parameters(), lr=self.config.lr)
+
+    @torch.no_grad()
+    def evaluate(self):
+        test_loss = 0
+        for i, (video, action) in enumerate(tqdm.tqdm(self.test_loader)):
+            video, action = video.to(device), action.to(device)
+            video = video[:,start:start+self.context_size,...]
+            action = action[:,start:start+self.context_size].unsqueeze(-1) + self.codebook_size
+
+            # tokenize the video
+            video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
+            _, indices, _ = self.vqvae.encode(video_vectorized)
+            indices = rearrange(indices, "(b f h w) -> b f (h w)", b=video.shape[0], f=self.context_size, w=int(self.spatial_size**0.5), h=int(self.spatial_size**0.5))
+
+            indices = torch.cat([indices, action], dim=2)
+
+            tokens = rearrange(indices, "b f s -> b (f s)")
+            x = tokens[:,:-1]
+            targets = tokens[:,1:].contiguous().view(-1)
+            logits, _ = self.gpt(x)
+            logits = rearrange(logits, "b t c -> (b t) c")
+            test_loss += F.cross_entropy(logits, targets).item()
+        test_loss /= len(test_loader)
+        wandb.log({"valid/loss": test_loss})
+        return test_loss, video, action, indices
+
+    def train(self):
+        pass
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="dmlab")
-    parser.add_argument("--context_size", type=int, default=12)
+    parser.add_argument("--context_size", type=int, default=2)
     args = parser.parse_args()
 
     codebook_size = 512
 
     if args.dataset == "dmlab":
         dataset_path = Path("../teco/dmlab/")
-        vqgan_config = VQGANConfig(
+        vqvae_config = VQGANConfig(
             num_codebook_vectors=codebook_size,
             latent_dim=8, 
             resolution=64, 
             ch_mult=(1, 2, 2, 2)
         )
 
+        gpt_config = GPTConfig(block_size=args.context_size*(vqvae_config.spatial_dim+1), 
+                               vocab_size=codebook_size+3, 
+                               n_embd=368, 
+                               n_head=4, 
+                               n_layer=4, 
+                               causal=True, 
+                               dropout=0.1)
+
+    config = TrainerConfig(gpt_config=gpt_config,
+                           gpt_path="gpt_best.pt",
+                           vqvae_config=vqvae_config,
+                           vqvae_path="vqvae_best.pt",
+                           dataset_path=dataset_path,
+                           gen_video_size=12,
+                           batch_size=8,
+                           lr=1e-4,
+                           vis_count=4,
+                           cond_video_length=4,
+                           cond_actions_length=10)
+
+    trainer = Trainer(config)
+
+    exit(0)
+
     start = 50
-    context_size = 2 # in frames
+    context_size = 4 # in frames
     bs = 8
     spatial_size = 64
     # visualization params
