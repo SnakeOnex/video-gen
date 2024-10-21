@@ -4,29 +4,54 @@ from pathlib import Path
 from vqvae import VQGAN, VQGANConfig
 from gpt import GPTLanguageModel, GPTConfig
 from dataset import VideoDataset, annotate_video, encode_video, action_to_text
-from train_st import pack_tokens, unpack_tokens, generate_video, make_video_plot
+from train_st import pack_tokens, unpack_tokens, generate_video, make_video_plot, TrainerConfig
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 if __name__ == '__main__':
-    gpt_path = Path('st_transformer_best.pt')
-
-    dataset = VideoDataset(Path("../teco/dmlab/test"))
-    codebook_size = 512
+    gpt_path = Path('gpt_best.pt')
     context_size = 2
-    spatial_size = 64
-    vqgan_config = VQGANConfig(
-        num_codebook_vectors=codebook_size,
+
+
+    dataset_path = Path("../teco/dmlab/")
+    dataset = VideoDataset(Path("../teco/dmlab/test"))
+
+
+    vqvae_config = VQGANConfig(
+        num_codebook_vectors=512,
         latent_dim=8, 
-        resolution=spatial_size, 
+        resolution=64, 
         ch_mult=(1, 2, 2, 2)
     )
 
-    vqvae = VQGAN(vqgan_config).to(device)
+    gpt_config = GPTConfig(block_size=context_size*(vqvae_config.spatial_dim**2+1), 
+                           vocab_size=vqvae_config.num_codebook_vectors+3, 
+                           n_embd=368, 
+                           n_head=4, 
+                           n_layer=4, 
+                           causal=True, 
+                           dropout=0.1)
+
+    config = TrainerConfig(gpt_config=gpt_config,
+                           gpt_path=gpt_path,
+                           vqvae_config=vqvae_config,
+                           vqvae_path="vqvae_best.pt",
+                           dataset_path=dataset_path,
+                           gen_video_size=12,
+                           epochs=100,
+                           batch_size=16,
+                           lr=3e-4,
+                           log_interval=10,
+                           eval_interval=1000,
+                           vis_count=4,
+                           cond_video_length=4,
+                           cond_actions_length=10)
+
+    vqvae = VQGAN(vqvae_config).to(device)
     vqvae.load_state_dict(torch.load("vqvae_dmlab_best.pt", weights_only=True, map_location=device))
-    gpt_config = GPTConfig(block_size=context_size*(spatial_size+1), 
-                           vocab_size=codebook_size+3, 
+    gpt_config = GPTConfig(block_size=context_size*(vqvae_config.spatial_dim**2+1), 
+                           vocab_size=vqvae_config.num_codebook_vectors+3, 
                            n_embd=368, 
                            n_head=4, 
                            n_layer=4, 
@@ -61,21 +86,21 @@ if __name__ == '__main__':
             action = 2
         else:
             return
-        action_tokens = action_tokens * 0 + action + codebook_size
+        action_tokens = action_tokens * 0 + action + config.codebook_size
         # cond_tokens = cond_tokens[:,1:,:]
 
     fig.canvas.mpl_connect('key_press_event', button_press)
 
     while True:
         print("Waiting for key press")
-        action_tokens = tokens[:,-1:,spatial_size:spatial_size+1]
+        action_tokens = tokens[:,-1:,config.spatial_dim**2:config.spatial_dim**2+1]
         print("pre-key: ", action_tokens)
         plt.waitforbuttonpress()
         print("post-key: ", action_tokens)
         # action_tokens = action_tokens * 0 + 2 + codebook_size
 
         # 2. generate video
-        cond_tokens = generate_video(cond_tokens, action_tokens, st_transformer, context_size)
+        cond_tokens = generate_video(cond_tokens, action_tokens, st_transformer, context_size, config.spatial_dim**2)
         cond_tokens = cond_tokens[:,1:,:]
         img = make_video_plot([cond_tokens], vqvae, nrow=cond_actions_length+1)
         ax.imshow(img)

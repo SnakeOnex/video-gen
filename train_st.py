@@ -199,6 +199,11 @@ class Trainer():
             test_loss += F.cross_entropy(logits, targets).item()
         test_loss /= len(self.test_loader)
         wandb.log({"valid/loss": test_loss})
+
+        if test_loss < self.best_loss:
+            self.best_loss = test_loss
+            torch.save(self.gpt.state_dict(), "gpt_best.pt")
+
         return test_loss, video, action, indices
 
     @torch.no_grad()
@@ -254,39 +259,37 @@ if __name__ == "__main__":
     parser.add_argument("--gpt_path", type=str, default=None)
     args = parser.parse_args()
 
-    codebook_size = 512
-
     if args.dataset == "dmlab":
         dataset_path = Path("../teco/dmlab/")
         vqvae_config = VQGANConfig(
-            num_codebook_vectors=codebook_size,
+            num_codebook_vectors=512,
             latent_dim=8, 
             resolution=64, 
             ch_mult=(1, 2, 2, 2)
         )
 
         gpt_config = GPTConfig(block_size=args.context_size*(vqvae_config.spatial_dim**2+1), 
-                               vocab_size=codebook_size+3, 
+                               vocab_size=vqvae_config.num_codebook_vectors+3, 
                                n_embd=368, 
                                n_head=4, 
                                n_layer=4, 
                                causal=True, 
                                dropout=0.1)
 
-    config = TrainerConfig(gpt_config=gpt_config,
-                           gpt_path=args.gpt_path,
-                           vqvae_config=vqvae_config,
-                           vqvae_path="vqvae_best.pt",
-                           dataset_path=dataset_path,
-                           gen_video_size=12,
-                           epochs=100,
-                           batch_size=16,
-                           lr=3e-4,
-                           log_interval=10,
-                           eval_interval=1000,
-                           vis_count=4,
-                           cond_video_length=4,
-                           cond_actions_length=10)
+        config = TrainerConfig(gpt_config=gpt_config,
+                               gpt_path=args.gpt_path,
+                               vqvae_config=vqvae_config,
+                               vqvae_path="vqvae_best.pt",
+                               dataset_path=dataset_path,
+                               gen_video_size=12,
+                               epochs=100,
+                               batch_size=16,
+                               lr=3e-4,
+                               log_interval=10,
+                               eval_interval=1000,
+                               vis_count=4,
+                               cond_video_length=4,
+                               cond_actions_length=10)
 
     wandb.init(project="st-video", name=f"{args.dataset}-{int(time.time()):.0f}", config=config.__dict__)
 
