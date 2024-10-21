@@ -18,7 +18,7 @@ from train_vqvae import make_plot
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def make_video(videos, output_path):
+def make_video(videos, output_path, vqvae):
     # B x T x C x H x W inputs
     # T x C x N*H x 2*W output
     video_columns = []
@@ -38,7 +38,6 @@ def make_video_plot(videos, vqvae, nrow=8):
     for i in range(len(videos)):
         video, actions = unpack_tokens(videos[i], vqvae)
         video_image_rows = []
-        print(video.shape, actions.shape)
         for b in range(video.shape[0]):
             video_numpy = annotate_video(video[b], actions[b])
             video_unrolled = rearrange(video_numpy, "t h w c -> h (t w) c")
@@ -96,7 +95,7 @@ def unpack_tokens(tokens, vqvae, spatial_size=64, codebook_size=512):
     return video, actions
 
 @torch.no_grad()
-def generate_video(cond_tokens, action_tokens, st_transformer, context_size, spatial_size=64):
+def generate_video(cond_tokens, action_tokens, gpt, context_size, spatial_size):
     """
     cond_tokens: B x T_cond x (S+1) tensor
     action_tokens: B x T_gen tensor
@@ -108,8 +107,8 @@ def generate_video(cond_tokens, action_tokens, st_transformer, context_size, spa
         action = action_tokens[:,t]
         tokens = torch.cat([tokens, action], dim=1)
         input_tokens = tokens[:,-(context_size-1)*(spatial_size+1):]
-        new_tokens = st_transformer.generate(input_tokens, spatial_size)[:,-spatial_size:]
-        print(f"generated {new_tokens.shape[1]} tokens, conditioned on {input_tokens.shape[1]} tokens")
+        new_tokens = gpt.generate(input_tokens, spatial_size)[:,-spatial_size:]
+        # print(f"generated {new_tokens.shape[1]} tokens, conditioned on {input_tokens.shape[1]} tokens")
         tokens = torch.cat([tokens, new_tokens], dim=1)
     tokens = torch.cat([tokens, action], dim=1)
     return rearrange(tokens, "b (t s) -> b t s", t=T_gen+T_cond, s=(spatial_size+1))
@@ -121,55 +120,100 @@ class TrainerConfig():
     vqvae_config: VQGANConfig
     vqvae_path: str
     dataset_path: str
-    context_size: int
-    spatial_size: int
     gen_video_size: int
+    epochs: int
     batch_size: int
     lr: float
+    log_interval: int
+    eval_interval: int
     vis_count: int
     cond_video_length: int
     cond_actions_length: int
 
     def __post_init__(self):
         self.spatial_dim = self.vqvae_config.spatial_dim
+        self.context_size = self.gpt_config.block_size // (self.spatial_dim**2 + 1)
+        self.codebook_size = self.vqvae_config.num_codebook_vectors
 
 class Trainer():
     def __init__(self, config: TrainerConfig):
         for k, v in config.__dict__.items(): setattr(self, k, v)
 
         # 1. init models
-        self.vqvae = VQGAN(self.config.vqvae_config).to(self.device).eval()
-        self.vqvae.load_state_dict(torch.load(self.config.vqvae_path, weights_only=True))
+        self.vqvae = VQGAN(self.vqvae_config).to(device).eval()
+        self.vqvae.load_state_dict(torch.load(self.vqvae_path, weights_only=True))
 
-        self.gpt = GPTLanguageModel(self.config.gpt_config).to(self.device)
-        self.gpt.load_state_dict(torch.load(self.config.gpt_path, weights_only=True))
+        self.gpt = GPTLanguageModel(self.gpt_config).to(device)
+        if self.gpt_path is not None:
+            self.gpt.load_state_dict(torch.load(self.gpt_path, weights_only=True))
 
         # 2. init optimizers
         self.optim = self.configure_optimizers()
 
         # 3. init datasets
-        self.train_loader = DataLoader(VideoDataset(self.config.dataset_path / "train"), batch_size=self.config.batch_size, shuffle=True, drop_last=True)
-        self.test_loader = DataLoader(VideoDataset(self.config.dataset_path / "test"), batch_size=2*self.config.batch_size, shuffle=True, drop_last=True)
+        self.train_loader = DataLoader(VideoDataset(self.dataset_path / "train"), batch_size=self.batch_size, shuffle=True, drop_last=True)
+        self.test_loader = DataLoader(VideoDataset(self.dataset_path / "test"), batch_size=2*self.batch_size, shuffle=True, drop_last=True)
 
         # 4. running variables
         self.steps = 0
         self.best_loss = float("inf")
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.gpt.parameters(), lr=self.config.lr)
+        return torch.optim.Adam(self.gpt.parameters(), lr=self.lr)
+
+    def train(self):
+        for epoch in range(self.epochs):
+            bar = tqdm.tqdm(self.train_loader)
+            for video, action in bar:
+                video, action = video.to(device), action.to(device)
+
+                # sample a random part of the video
+                start = torch.randint(0, video.shape[1]-self.context_size, (1,))
+                video = video[:,start:start+self.context_size,...]
+                action = action[:,start:start+self.context_size].unsqueeze(-1) + self.codebook_size
+
+                # tokenize the video
+                with torch.no_grad():
+                    video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
+                    _, indices, _ = self.vqvae.encode(video_vectorized)
+                    # indices = rearrange(indices, "(b f h w) -> b f (h w)", b=bs, f=self.context_size, w=int(spatial_size**0.5), h=int(spatial_size**0.5))
+                    indices = rearrange(indices, "(b f h w) -> b f (h w)", b=self.batch_size, f=self.context_size, h=self.spatial_dim)
+
+                # append action tokens
+                # b x f x 1 + b x f x s = b x f x (s+1)
+                indices = torch.cat([indices, action], dim=2)
+                tokens = rearrange(indices, "b f s -> b (f s)")
+                x = tokens[:,:-1]
+                targets = tokens[:,1:].contiguous().view(-1)
+                logits, _ = self.gpt(x)
+                logits = rearrange(logits, "b t c -> (b t) c")
+                loss = F.cross_entropy(logits, targets)
+
+                self.optim.zero_grad()
+                loss.backward()
+                self.optim.step()
+                self.steps += 1
+                bar.set_description(f"{epoch=}: loss={loss.item():.3f}")
+
+                if self.steps % self.log_interval == 0: wandb.log({"train/loss": loss.item()})
+
+                if self.steps % self.eval_interval == 0:
+                    self.evaluate()
+                    self.visualize()
 
     @torch.no_grad()
     def evaluate(self):
         test_loss = 0
         for i, (video, action) in enumerate(tqdm.tqdm(self.test_loader)):
             video, action = video.to(device), action.to(device)
+            start = torch.randint(0, video.shape[1]-self.context_size, (1,))
             video = video[:,start:start+self.context_size,...]
             action = action[:,start:start+self.context_size].unsqueeze(-1) + self.codebook_size
 
             # tokenize the video
             video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
             _, indices, _ = self.vqvae.encode(video_vectorized)
-            indices = rearrange(indices, "(b f h w) -> b f (h w)", b=video.shape[0], f=self.context_size, w=int(self.spatial_size**0.5), h=int(self.spatial_size**0.5))
+            indices = rearrange(indices, "(b f h w) -> b f (h w)", b=video.shape[0], f=self.context_size, w=self.spatial_dim)
 
             indices = torch.cat([indices, action], dim=2)
 
@@ -179,17 +223,61 @@ class Trainer():
             logits, _ = self.gpt(x)
             logits = rearrange(logits, "b t c -> (b t) c")
             test_loss += F.cross_entropy(logits, targets).item()
-        test_loss /= len(test_loader)
+        test_loss /= len(self.test_loader)
         wandb.log({"valid/loss": test_loss})
         return test_loss, video, action, indices
 
-    def train(self):
-        pass
+    @torch.no_grad()
+    def visualize(self):
+        # 1. get a batch of test data
+        video, action = next(iter(self.test_loader))
+        video, action = video.to(device)[:self.vis_count], action.to(device)[:self.vis_count]
+
+        # 2. sample a random part of the video
+        start = torch.randint(0, video.shape[1]-self.cond_video_length-self.cond_actions_length, (1,))
+        video = video[:,start:start+self.cond_video_length+self.cond_actions_length]
+        action = action[:,start:start+self.cond_video_length+self.cond_actions_length]
+
+        # 3. pack the tokens
+        orig_tokens = pack_tokens(video, action, self.vqvae, spatial_size=self.spatial_dim**2, codebook_size=self.codebook_size)
+        action_tokens = orig_tokens[:,-self.cond_actions_length:,self.spatial_dim**2:self.spatial_dim**2+1]
+        cond_tokens = orig_tokens[:,:self.cond_video_length,:]
+
+        # 4. generate the video
+        gen_tokens = generate_video(cond_tokens, action_tokens, self.gpt, self.context_size, self.spatial_dim**2)
+
+        # 5. visualize the video
+        video_img = make_video_plot([orig_tokens, gen_tokens], self.vqvae, nrow=self.cond_video_length+self.cond_actions_length)
+        wandb.log({f"video cond={self.cond_video_length}": wandb.Image(video_img,file_type="jpg")})
+        make_video([orig_tokens, gen_tokens], "video.mp4", self.vqvae)
+        wandb.log({f"video cond={self.cond_video_length}": wandb.Video("video.mp4")})
+
+        for action in range(3):
+            new_action_tokens = action_tokens * 0 + action + self.codebook_size
+            gen_tokens = generate_video(cond_tokens, new_action_tokens, self.gpt, self.context_size, self.spatial_dim**2)
+            name = action_to_text(action)
+            video_img = make_video_plot([orig_tokens, gen_tokens], self.vqvae, nrow=self.cond_video_length+self.cond_actions_length)
+            wandb.log({f"action={name}": wandb.Image(video_img,file_type="jpg")})
+            make_video([orig_tokens, gen_tokens], f"video_{name}.mp4", self.vqvae)
+            wandb.log({f"action={name}": wandb.Video(f"video_{name}.mp4")})
+
+        # alternating left and right
+        actions = [0, 0] + [1 if i % 8 < 4 else 0 for i in range(self.cond_actions_length-2)]
+        new_action_tokens = action_tokens*0 + self.codebook_size
+        for i in range(0, len(actions)):
+            new_action_tokens[:,i,:] += actions[i]
+        gen_tokens = generate_video(cond_tokens, new_action_tokens, self.gpt, self.context_size, self.spatial_dim**2)
+        video_img = make_video_plot([orig_tokens, gen_tokens], self.vqvae, nrow=self.cond_video_length+self.cond_actions_length)
+        wandb.log({f"action=alternating": wandb.Image(video_img,file_type="jpg")})
+        make_video([orig_tokens, gen_tokens], "video_alternating.mp4", self.vqvae)
+        wandb.log({f"action=alternating": wandb.Video("video_alternating.mp4")})
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="dmlab")
     parser.add_argument("--context_size", type=int, default=2)
+    parser.add_argument("--gpt_path", type=str, default=None)
     args = parser.parse_args()
 
     codebook_size = 512
@@ -203,7 +291,7 @@ if __name__ == "__main__":
             ch_mult=(1, 2, 2, 2)
         )
 
-        gpt_config = GPTConfig(block_size=args.context_size*(vqvae_config.spatial_dim+1), 
+        gpt_config = GPTConfig(block_size=args.context_size*(vqvae_config.spatial_dim**2+1), 
                                vocab_size=codebook_size+3, 
                                n_embd=368, 
                                n_head=4, 
@@ -212,136 +300,21 @@ if __name__ == "__main__":
                                dropout=0.1)
 
     config = TrainerConfig(gpt_config=gpt_config,
-                           gpt_path="gpt_best.pt",
+                           gpt_path=args.gpt_path,
                            vqvae_config=vqvae_config,
                            vqvae_path="vqvae_best.pt",
                            dataset_path=dataset_path,
                            gen_video_size=12,
-                           batch_size=8,
-                           lr=1e-4,
+                           epochs=100,
+                           batch_size=16,
+                           lr=3e-4,
+                           log_interval=10,
+                           eval_interval=1000,
                            vis_count=4,
                            cond_video_length=4,
                            cond_actions_length=10)
 
+    wandb.init(project="st-video", name=f"{args.dataset}-{int(time.time()):.0f}", config=config.__dict__)
+
     trainer = Trainer(config)
-
-    exit(0)
-
-    start = 50
-    context_size = 4 # in frames
-    bs = 8
-    spatial_size = 64
-    # visualization params
-    vis_count = 4
-    gen_video_size = 12
-    cond_video_length = 4 # how many frames to input as conditioning
-    cond_actions_length = 10 # how many actions to input as conditioning
-
-    wandb.init(project="st-video", 
-               name=f"{args.dataset}-{int(time.time()):.0f}",
-               config=vqgan_config.__dict__)
-
-    train_set = VideoDataset(dataset_path / "train")
-    test_set = VideoDataset(dataset_path / "test")
-
-    print(f"loaded {len(train_set)} train and {len(test_set)} test videos")
-
-    train_loader = DataLoader(train_set, batch_size=bs, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_set, batch_size=bs, shuffle=True, drop_last=True)
-
-    vqvae = VQGAN(vqgan_config).to(device)
-    vqvae.load_state_dict(torch.load("vqvae_dmlab_best.pt", weights_only=True))
-    gpt_config = GPTConfig(block_size=context_size*(spatial_size+1), 
-                           vocab_size=codebook_size+3, 
-                           n_embd=368, 
-                           n_head=4, 
-                           n_layer=4, 
-                           causal=True, 
-                           dropout=0.1)
-    st_transformer = GPTLanguageModel(gpt_config).to(device)
-    optim = torch.optim.Adam(st_transformer.parameters(), lr=1e-4)
-
-    steps = 0
-    best_loss = float("inf")
-    for epoch in range(100):
-        for i, (video, action) in enumerate(tqdm.tqdm(train_loader)):
-            video = video.to(device)
-            action = action.to(device)
-            start = torch.randint(0, video.shape[1]-context_size, (1,))
-            video = video[:,start:start+context_size,...]
-            action = action[:,start:start+context_size].unsqueeze(-1) + codebook_size
-
-            # tokenize the video
-            with torch.no_grad():
-                video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
-                _, indices, _ = vqvae.encode(video_vectorized)
-                indices = rearrange(indices, "(b f h w) -> b f (h w)", b=bs, f=context_size, w=int(spatial_size**0.5), h=int(spatial_size**0.5))
-
-            # append action tokens
-            # b x f x 1 + b x f x s = b x f x (s+1)
-            indices = torch.cat([indices, action], dim=2)
-            tokens = rearrange(indices, "b f s -> b (f s)")
-            x = tokens[:,:-1]
-            targets = tokens[:,1:].contiguous().view(-1)
-
-            logits, _ = st_transformer(x)
-            logits = rearrange(logits, "b t c -> (b t) c")
-            loss = F.cross_entropy(logits, targets)
-
-            optim.zero_grad()
-            loss.backward()
-            optim.step()
-
-            if steps % 1000 == 0:
-                test_loss, video, action, indices = evaluate()
-                for i, (video, action) in enumerate(tqdm.tqdm(test_loader)):
-                    video = video.to(device)
-                    action = action.to(device)
-                    start = torch.randint(0, video.shape[1]-cond_actions_length-cond_video_length, (1,))
-                    video = video[:vis_count,start:start+cond_actions_length+cond_video_length]
-                    action = action[:vis_count,start:start+cond_actions_length+cond_video_length]
-                    orig_tokens = pack_tokens(video, action, vqvae)
-                    break
-
-                if test_loss < best_loss:
-                    best_loss = test_loss
-                    torch.save(st_transformer.state_dict(), "st_transformer_best.pt")
-                    torch.save(vqvae.state_dict(), "vqvae_best.pt")
-                else:
-                    exit(0)
-
-                with torch.no_grad():
-                    action_tokens = orig_tokens[0:vis_count,-cond_actions_length:,spatial_size:spatial_size+1]
-                    cond_tokens = orig_tokens[0:vis_count,:cond_video_length,:]
-
-                    gen_tokens = generate_video(cond_tokens, action_tokens, st_transformer, context_size)
-                    video_img = make_video_plot([orig_tokens, gen_tokens], vqvae, nrow=cond_video_length+cond_actions_length)
-                    wandb.log({f"video cond={cond_video_length}": wandb.Image(video_img,file_type="jpg")})
-                    make_video([orig_tokens, gen_tokens], "video.mp4")
-                    wandb.log({f"video cond={cond_video_length}": wandb.Video("video.mp4")})
-
-                    for action in range(3):
-                        new_action_tokens = action_tokens * 0 + action + codebook_size
-                        gen_tokens = generate_video(cond_tokens, new_action_tokens, st_transformer, context_size)
-                        name = action_to_text(action)
-                        video_img = make_video_plot([orig_tokens, gen_tokens], vqvae, nrow=cond_video_length+cond_actions_length)
-                        wandb.log({f"action={name}": wandb.Image(video_img,file_type="jpg")})
-                        make_video([orig_tokens, gen_tokens], f"video_{name}.mp4")
-                        wandb.log({f"action={name}": wandb.Video(f"video_{name}.mp4")})
-
-                    # alternating left and right
-                    actions = [0, 0] + [1 if i % 8 < 4 else 0 for i in range(cond_actions_length-2)]
-                    new_action_tokens = action_tokens*0 + codebook_size
-                    for i in range(0, len(actions)):
-                        new_action_tokens[:,i,:] += actions[i]
-                    gen_tokens = generate_video(cond_tokens, new_action_tokens, st_transformer, context_size)
-                    video_img = make_video_plot([orig_tokens, gen_tokens], vqvae, nrow=cond_video_length+cond_actions_length)
-                    wandb.log({f"action=alternating": wandb.Image(video_img,file_type="jpg")})
-                    make_video([orig_tokens, gen_tokens], "video_alternating.mp4")
-                    wandb.log({f"action=alternating": wandb.Video("video_alternating.mp4")})
-
-
-            if steps % 10 == 0:
-                wandb.log({"train/loss": loss.item()})
-            steps += 1
-
+    trainer.train()

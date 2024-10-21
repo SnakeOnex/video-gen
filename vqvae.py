@@ -6,7 +6,6 @@ class VQGANConfig:
     num_codebook_vectors: int = 2048
     latent_dim: int = 256
     beta: float = 0.25
-    double_z: bool = False
     resolution: int = 256
     in_channels: int = 3
     out_ch: int = 3
@@ -91,7 +90,7 @@ class Codebook(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, spatial_dim, double_z=True, **ignore_kwargs):
+                 resolution, spatial_dim, **ignore_kwargs):
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
