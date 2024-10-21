@@ -52,32 +52,6 @@ def make_video_plot(videos, vqvae, nrow=8):
     final_grid = np.concatenate(final_rows, axis=0)
     return PIL.Image.fromarray(final_grid)
 
-@torch.no_grad()
-def evaluate():
-    test_loss = 0
-    for i, (video, action) in enumerate(tqdm.tqdm(test_loader)):
-        video = video.to(device)
-        action = action.to(device)
-        video = video[:,start:start+context_size,...]
-        action = action[:,start:start+context_size].unsqueeze(-1) + codebook_size
-
-        # tokenize the video
-        video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
-        _, indices, _ = vqvae.encode(video_vectorized)
-        indices = rearrange(indices, "(b f h w) -> b f (h w)", b=video.shape[0], f=context_size, w=int(spatial_size**0.5), h=int(spatial_size**0.5))
-
-        indices = torch.cat([indices, action], dim=2)
-
-        tokens = rearrange(indices, "b f s -> b (f s)")
-        x = tokens[:,:-1]
-        targets = tokens[:,1:].contiguous().view(-1)
-        logits, _ = st_transformer(x)
-        logits = rearrange(logits, "b t c -> (b t) c")
-        test_loss += F.cross_entropy(logits, targets).item()
-    test_loss /= len(test_loader)
-    wandb.log({"valid/loss": test_loss})
-    return test_loss, video, action, indices
-
 def pack_tokens(video, actions, vqvae, spatial_size=64, codebook_size=512):
     video_vectorized = rearrange(video, "b f c h w -> (b f) c h w")
     _, indices, _ = vqvae.encode(video_vectorized)
