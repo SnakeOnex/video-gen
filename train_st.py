@@ -81,7 +81,7 @@ def generate_video(cond_tokens, action_tokens, gpt, context_size, spatial_size):
         action = action_tokens[:,t]
         tokens = torch.cat([tokens, action], dim=1)
         input_tokens = tokens[:,-(context_size-1)*(spatial_size+1):]
-        new_tokens = gpt.generate(input_tokens, spatial_size)[:,-spatial_size:]
+        new_tokens = gpt.generate(input_tokens, spatial_size, verbose=True)[:,-spatial_size:]
         # print(f"generated {new_tokens.shape[1]} tokens, conditioned on {input_tokens.shape[1]} tokens")
         tokens = torch.cat([tokens, new_tokens], dim=1)
     tokens = torch.cat([tokens, action], dim=1)
@@ -255,7 +255,7 @@ class Trainer():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="dmlab")
-    parser.add_argument("--context_size", type=int, default=2)
+    parser.add_argument("--context_size", type=int, default=8)
     parser.add_argument("--gpt_path", type=str, default=None)
     args = parser.parse_args()
 
@@ -263,8 +263,8 @@ if __name__ == "__main__":
         dataset_path = Path("../teco/dmlab/")
         vqvae_config = VQGANConfig(
             num_codebook_vectors=512,
-            latent_dim=8, 
-            resolution=64, 
+            latent_dim=8,
+            resolution=64,
             ch_mult=(1, 2, 2, 2)
         )
 

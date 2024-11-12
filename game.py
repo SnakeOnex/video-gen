@@ -10,7 +10,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 if __name__ == '__main__':
-    gpt_path = Path('gpt_best.pt')
+    gpt_path = Path('gpt_best_context_2.pt')
     context_size = 2
 
 
